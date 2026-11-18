@@ -1,14 +1,18 @@
 import hmac
 import html
 import io
+import ipaddress
 import mimetypes
 import os
+import re
+import secrets
+import socket
 import tempfile
 import time
 import zipfile
-from datetime import timezone
+from datetime import datetime, timezone
 from functools import wraps
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import boto3
 import markdown as md_lib
@@ -24,6 +28,7 @@ from flask import (
     render_template,
     request,
     send_file,
+    session,
 )
 
 load_dotenv()
@@ -39,12 +44,16 @@ APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
 PAGE_SIZE = 200
 TEXT_PREVIEW_MAX_BYTES = 512 * 1024  # 512 KB
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", 100))
 MAX_FOLDER_ZIP_BYTES = int(os.getenv("MAX_FOLDER_ZIP_BYTES", 500 * 1024 * 1024))
 BUCKET_QUOTA_GIB = float(os.getenv("BUCKET_QUOTA_GIB", 250))
 BUCKET_STATS_CACHE_TTL = 300  # 5 minuti
 _bucket_stats_cache = {"data": None, "ts": 0.0}
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico"}
+UNSAFE_INLINE_EXTENSIONS = {
+    ".html", ".htm", ".svg", ".xml", ".xhtml", ".js", ".mjs", ".swf",
+}
 PDF_EXTENSIONS = {".pdf"}
 ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
@@ -60,6 +69,80 @@ TEXT_EXTENSIONS = {
 }
 
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+
+def get_csrf_token() -> str:
+    """Return or generate a per-session CSRF token."""
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_hex(32)
+        session["_csrf_token"] = token
+    return token
+
+
+@app.context_processor
+def inject_globals():
+    return {
+        "csrf_token": get_csrf_token(),
+        "current_year": datetime.now(timezone.utc).year,
+    }
+
+
+@app.before_request
+def verify_csrf():
+    if request.method in {"POST", "PUT", "DELETE", "PATCH"}:
+        expected = session.get("_csrf_token")
+        provided = (
+            request.headers.get("X-CSRF-Token")
+            or request.form.get("csrf_token")
+            or ""
+        )
+        if not expected or not provided or not hmac.compare_digest(provided, expected):
+            return jsonify({"error": "Token CSRF mancante o non valido."}), 403
+
+
+@app.after_request
+def set_security_headers(response: Response) -> Response:
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://uicdn.toast.com; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://uicdn.toast.com; "
+        "font-src 'self' https://cdnjs.cloudflare.com data:; "
+        "img-src 'self' data: blob: https:; "
+        "frame-src 'self' https:; "
+        "connect-src 'self';",
+    )
+    return response
+
+
+@app.errorhandler(413)
+def handle_request_entity_too_large(_err):
+    msg = f"Il file supera la dimensione massima consentita ({MAX_UPLOAD_MB} MB)."
+    if request.path.startswith("/api/"):
+        return jsonify({"error": msg}), 413
+    return Response(msg, 413)
+
+
+def safe_error_message(exc: Exception, fallback: str = "Operazione non riuscita sullo storage.") -> str:
+    """Log technical exception details server-side and return a safe message."""
+    app.logger.warning("Storage/App error: %s", exc)
+    if isinstance(exc, ValueError):
+        return str(exc)
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in {"NoSuchKey", "404"}:
+            return "Elemento non trovato nel bucket."
+        if code in {"AccessDenied", "403"}:
+            return "Accesso negato sul bucket."
+    return fallback
 
 
 def check_auth(username: str, password: str) -> bool:
@@ -102,11 +185,24 @@ def get_s3_client():
 
 
 def normalize_prefix(raw_prefix: str) -> str:
-    """Normalize an S3 prefix so it has no leading slash and ends with '/' if non-empty."""
-    cleaned = (raw_prefix or "").strip().lstrip("/")
-    if cleaned and not cleaned.endswith("/"):
-        cleaned += "/"
-    return cleaned
+    """Normalize an S3 prefix, stripping '.' / '..' segments and control chars."""
+    raw = (raw_prefix or "").replace("\\", "/").strip()
+    raw = re.sub(r"[\x00-\x1f\x7f]", "", raw)
+    parts = [p for p in raw.split("/") if p and p not in {".", ".."}]
+    if not parts:
+        return ""
+    return "/".join(parts) + "/"
+
+
+def sanitize_s3_key(raw_key: str) -> str:
+    """Validate and normalize an S3 object key, rejecting '..' traversal."""
+    raw = (raw_key or "").replace("\\", "/").strip().lstrip("/")
+    if not raw or raw.endswith("/") or re.search(r"[\x00-\x1f\x7f]", raw):
+        return ""
+    parts = [p for p in raw.split("/") if p]
+    if not parts or any(p in {".", ".."} for p in parts):
+        return ""
+    return "/".join(parts)
 
 
 def format_size(num_bytes: int) -> str:
@@ -271,6 +367,10 @@ def sort_entries(folders: list, files: list, sort_by: str, order: str) -> None:
 def generate_presigned_url(client, key: str, inline: bool = False) -> str:
     """Generate a short-lived presigned URL for downloading or viewing an object."""
     filename = os.path.basename(key) or "file"
+    _, ext = os.path.splitext(filename.lower())
+    if ext in UNSAFE_INLINE_EXTENSIONS:
+        inline = False
+
     disposition = "inline" if inline else f'attachment; filename="{quote(filename)}"'
     params = {
         "Bucket": BUCKET_NAME,
@@ -320,7 +420,7 @@ def index():
         next_token = result["next_token"]
         sort_entries(folders, files, sort_by, order)
     except (ClientError, ValueError) as exc:
-        error = str(exc)
+        error = safe_error_message(exc)
 
     parent_prefix = None
     if prefix:
@@ -349,8 +449,8 @@ def index():
 @app.route("/download")
 @requires_auth
 def download():
-    key = request.args.get("key", "").lstrip("/")
-    if not key or key.endswith("/"):
+    key = sanitize_s3_key(request.args.get("key", ""))
+    if not key:
         abort(400, "Chiave file non valida.")
 
     try:
@@ -358,14 +458,14 @@ def download():
         url = generate_presigned_url(client, key, inline=False)
         return redirect(url, code=302)
     except (ClientError, ValueError) as exc:
-        abort(500, str(exc))
+        abort(500, safe_error_message(exc))
 
 
 @app.route("/open")
 @requires_auth
 def open_inline():
-    key = request.args.get("key", "").lstrip("/")
-    if not key or key.endswith("/"):
+    key = sanitize_s3_key(request.args.get("key", ""))
+    if not key:
         abort(400, "Chiave file non valida.")
 
     try:
@@ -373,14 +473,14 @@ def open_inline():
         url = generate_presigned_url(client, key, inline=True)
         return redirect(url, code=302)
     except (ClientError, ValueError) as exc:
-        abort(500, str(exc))
+        abort(500, safe_error_message(exc))
 
 
 @app.route("/api/preview")
 @requires_auth
 def api_preview():
-    key = request.args.get("key", "").lstrip("/")
-    if not key or key.endswith("/"):
+    key = sanitize_s3_key(request.args.get("key", ""))
+    if not key:
         return jsonify({"error": "Chiave file non valida."}), 400
 
     filename = os.path.basename(key)
@@ -421,14 +521,16 @@ def api_preview():
         )
     except ClientError as exc:
         code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500)
-        return jsonify({"error": str(exc)}), code
+        return jsonify({"error": safe_error_message(exc)}), code
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": safe_error_message(exc)}), 500
 
 
 def sanitize_entry_name(raw_name: str) -> str:
-    """Extract a safe single filename or folder name without path traversal."""
-    cleaned = os.path.basename((raw_name or "").replace("\\", "/")).strip()
+    """Extract a safe single filename or folder name without path traversal or control chars."""
+    raw = (raw_name or "").replace("\\", "/")
+    raw = re.sub(r"[\x00-\x1f\x7f]", "", raw)
+    cleaned = os.path.basename(raw).strip()
     if not cleaned or cleaned in {".", ".."}:
         return ""
     return cleaned
@@ -443,12 +545,49 @@ def object_exists(client, key: str) -> bool:
         return False
 
 
+_DANGEROUS_HTML_TAG_RE = re.compile(
+    r"</?\s*(?:script|iframe|object|embed|link|meta|base|form|input|button|style|applet|svg|math)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def sanitize_rendered_html(raw_html: str) -> str:
+    """Strip dangerous HTML elements from rendered Markdown before PDF conversion."""
+    cleaned = _DANGEROUS_HTML_TAG_RE.sub("", raw_html or "")
+    cleaned = re.sub(r"\son[a-z]+\s*=", " data-blocked=", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def safe_weasyprint_url_fetcher(url: str):
+    """Allow only data: URIs and public HTTPS URLs (blocking file:// and private/local IPs)."""
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme == "data":
+        return weasyprint.default_url_fetcher(url)
+    if scheme != "https" or not parsed.hostname:
+        raise ValueError(f"Schema o URL non consentito nel PDF: {scheme}")
+
+    try:
+        addr_infos = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError("Impossibile risolvere l'host della risorsa esterna.") from exc
+
+    for info in addr_infos:
+        ip_str = info[4][0]
+        ip_obj = ipaddress.ip_address(ip_str)
+        if not ip_obj.is_global:
+            raise ValueError("Accesso a indirizzi IP privati o locali bloccato.")
+
+    return weasyprint.default_url_fetcher(url)
+
+
 def markdown_to_pdf_bytes(md_text: str, title: str = "Documento") -> bytes:
     """Convert Markdown text into a styled PDF byte payload using WeasyPrint."""
-    body_html = md_lib.markdown(
+    raw_body_html = md_lib.markdown(
         md_text or "",
         extensions=["tables", "fenced_code", "nl2br", "sane_lists"],
     )
+    body_html = sanitize_rendered_html(raw_body_html)
     safe_title = html.escape(title)
     full_html = f"""<!DOCTYPE html>
 <html lang="it">
@@ -519,7 +658,10 @@ def markdown_to_pdf_bytes(md_text: str, title: str = "Documento") -> bytes:
   {body_html}
 </body>
 </html>"""
-    return weasyprint.HTML(string=full_html).write_pdf()
+    return weasyprint.HTML(
+        string=full_html,
+        url_fetcher=safe_weasyprint_url_fetcher,
+    ).write_pdf()
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -571,7 +713,7 @@ def api_upload():
 
         return jsonify({"uploaded": uploaded_keys, "count": len(uploaded_keys)})
     except (ClientError, ValueError) as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": safe_error_message(exc)}), 500
 
 
 @app.route("/api/mkdir", methods=["POST"])
@@ -589,7 +731,7 @@ def api_mkdir():
         client.put_object(Bucket=BUCKET_NAME, Key=folder_key, Body=b"")
         return jsonify({"prefix": folder_key, "name": name})
     except (ClientError, ValueError) as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": safe_error_message(exc)}), 500
 
 
 @app.route("/download-folder")
@@ -626,7 +768,9 @@ def download_folder():
         tmp = tempfile.SpooledTemporaryFile(max_size=20 * 1024 * 1024)
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
             for key in objects:
-                arcname = key[len(prefix) :] if prefix else key
+                raw_arc = key[len(prefix) :] if prefix else key
+                safe_parts = [p for p in raw_arc.replace("\\", "/").split("/") if p and p not in {".", ".."}]
+                arcname = "/".join(safe_parts)
                 if not arcname:
                     continue
                 obj = client.get_object(Bucket=BUCKET_NAME, Key=key)
@@ -642,21 +786,23 @@ def download_folder():
             mimetype="application/zip",
         )
     except (ClientError, ValueError) as exc:
-        abort(500, str(exc))
+        abort(500, safe_error_message(exc))
 
 
 @app.route("/editor")
 @requires_auth
 def editor():
-    key = request.args.get("key", "").lstrip("/")
+    raw_key = request.args.get("key", "")
+    key = sanitize_s3_key(raw_key) if raw_key else ""
     prefix = normalize_prefix(request.args.get("prefix", ""))
     filename = "nuovo-documento.md"
     content = ""
     error = None
 
+    if raw_key and not key:
+        abort(400, "Chiave file non valida.")
+
     if key:
-        if key.endswith("/"):
-            abort(400, "Chiave file non valida.")
         filename = os.path.basename(key)
         parent = os.path.dirname(key)
         prefix = normalize_prefix(parent)
@@ -665,7 +811,7 @@ def editor():
             obj = client.get_object(Bucket=BUCKET_NAME, Key=key)
             content = obj["Body"].read().decode("utf-8", errors="replace")
         except (ClientError, ValueError) as exc:
-            error = str(exc)
+            error = safe_error_message(exc)
 
     return render_template(
         "editor.html",
@@ -702,7 +848,7 @@ def api_markdown_save():
         )
         return jsonify({"key": key, "filename": raw_name})
     except (ClientError, ValueError) as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": safe_error_message(exc)}), 500
 
 
 @app.route("/api/markdown/pdf", methods=["POST"])
@@ -737,7 +883,7 @@ def api_markdown_pdf():
             mimetype="application/pdf",
         )
     except (ClientError, ValueError) as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": safe_error_message(exc)}), 500
 
 
 @app.route("/api/bucket-stats")
@@ -784,7 +930,7 @@ def api_bucket_stats():
         _bucket_stats_cache["ts"] = now
         return jsonify(payload)
     except (ClientError, ValueError) as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": safe_error_message(exc)}), 500
 
 
 if __name__ == "__main__":

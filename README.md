@@ -21,7 +21,17 @@ Strumenti Python per gestire e consultare un bucket DigitalOcean Spaces (S3-comp
   - Creazione di nuovi file `.md` o modifica di file `.md` esistenti con **Toast UI Editor** (modalità WYSIWYG e Markdown).
   - Salvataggio diretto nel bucket e generazione PDF lato server (`markdown` + `weasyprint`) per download locale o salvataggio nel bucket.
 - **Statistiche & Spazio Bucket**: barra superiore con calcolo asincrono della dimensione totale del bucket, numero di file e percentuale di utilizzo su `250 GiB` (configurabile con `BUCKET_QUOTA_GIB`, cache 5 minuti con refresh manuale). *Nota: il traffico outbound (1 TiB/mese) non è esposto dalle API di DigitalOcean Spaces ed è consultabile dal pannello Billing.*
-- **Interfaccia**: Bootstrap 5.3 + Font Awesome 6.5 sui toni di grigio con toggle tema Chiaro/Scuro salvato in `localStorage`.
+- **Interfaccia**: Bootstrap 5.3 + Font Awesome 6.5 sui toni di grigio con toggle tema Chiaro/Scuro salvato in `localStorage` e footer con riferimenti DigitalOcean, GitHub e LinkedIn.
+
+---
+
+## Sicurezza
+
+- **Protezione CSRF**: token CSRF automatico per sessione (`HttpOnly`, `SameSite=Lax`) verificato tramite header `X-CSRF-Token` su tutte le richieste `POST`/`PUT`/`DELETE`/`PATCH`.
+- **Protezione SSRF & HTML in WeasyPrint**: la generazione PDF blocca URL `file://`, `http://` e IP privati/locali (consentendo solo `data:` URI e `https://` pubblici) e rimuove tag/attributi HTML pericolosi prima del rendering.
+- **Limiti & File attivi**: limite massimo di upload configurabile (`MAX_UPLOAD_MB`, default `100` MB) e download forzato (`attachment`) su `/open` per file potenzialmente attivi (`.html`, `.svg`, `.xml`, `.js`, ecc.).
+- **Validazione Path & Zip Slip**: sanificazione di prefissi, chiavi S3 e percorsi interni agli archivi `.zip` contro path traversal (`..`).
+- **Security Headers & Errori**: header `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Content-Security-Policy` e messaggi di errore sanificati lato client.
 
 ---
 
@@ -43,6 +53,8 @@ RETENTION_DAYS=30
 # APP_PASSWORD=password_sicura
 # FLASK_PORT=5000
 # FLASK_DEBUG=false
+# FLASK_SECRET_KEY=chiave_segreta_casuale
+# MAX_UPLOAD_MB=100
 # MAX_FOLDER_ZIP_BYTES=524288000
 # BUCKET_QUOTA_GIB=250
 ```
