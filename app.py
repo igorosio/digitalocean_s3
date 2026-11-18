@@ -4,6 +4,7 @@ import io
 import mimetypes
 import os
 import tempfile
+import time
 import zipfile
 from datetime import timezone
 from functools import wraps
@@ -39,6 +40,9 @@ APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 PAGE_SIZE = 200
 TEXT_PREVIEW_MAX_BYTES = 512 * 1024  # 512 KB
 MAX_FOLDER_ZIP_BYTES = int(os.getenv("MAX_FOLDER_ZIP_BYTES", 500 * 1024 * 1024))
+BUCKET_QUOTA_GIB = float(os.getenv("BUCKET_QUOTA_GIB", 250))
+BUCKET_STATS_CACHE_TTL = 300  # 5 minuti
+_bucket_stats_cache = {"data": None, "ts": 0.0}
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
 PDF_EXTENSIONS = {".pdf"}
@@ -732,6 +736,53 @@ def api_markdown_pdf():
             download_name=pdf_filename,
             mimetype="application/pdf",
         )
+    except (ClientError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/bucket-stats")
+@requires_auth
+def api_bucket_stats():
+    """Calculate total bucket size and usage percentage against BUCKET_QUOTA_GIB."""
+    force_refresh = request.args.get("refresh") == "1"
+    now = time.time()
+    if (
+        not force_refresh
+        and _bucket_stats_cache["data"] is not None
+        and (now - _bucket_stats_cache["ts"]) < BUCKET_STATS_CACHE_TTL
+    ):
+        cached_payload = dict(_bucket_stats_cache["data"])
+        cached_payload["cached"] = True
+        return jsonify(cached_payload)
+
+    try:
+        client = get_s3_client()
+        paginator = client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=BUCKET_NAME)
+
+        total_bytes = 0
+        total_files = 0
+        for page in pages:
+            for obj in page.get("Contents", []):
+                if obj["Key"].endswith("/"):
+                    continue
+                total_bytes += obj.get("Size", 0)
+                total_files += 1
+
+        quota_bytes = BUCKET_QUOTA_GIB * (1024 ** 3)
+        percent = round((total_bytes / quota_bytes) * 100.0, 2) if quota_bytes > 0 else 0.0
+
+        payload = {
+            "total_bytes": total_bytes,
+            "total_human": format_size(total_bytes),
+            "total_files": total_files,
+            "quota_gib": int(BUCKET_QUOTA_GIB) if BUCKET_QUOTA_GIB.is_integer() else BUCKET_QUOTA_GIB,
+            "percent": percent,
+            "cached": False,
+        }
+        _bucket_stats_cache["data"] = payload
+        _bucket_stats_cache["ts"] = now
+        return jsonify(payload)
     except (ClientError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 500
 

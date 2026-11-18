@@ -20,6 +20,7 @@ Strumenti Python per gestire e consultare un bucket DigitalOcean Spaces (S3-comp
 - **Editor WYSIWYG Markdown & PDF**:
   - Creazione di nuovi file `.md` o modifica di file `.md` esistenti con **Toast UI Editor** (modalità WYSIWYG e Markdown).
   - Salvataggio diretto nel bucket e generazione PDF lato server (`markdown` + `weasyprint`) per download locale o salvataggio nel bucket.
+- **Statistiche & Spazio Bucket**: barra superiore con calcolo asincrono della dimensione totale del bucket, numero di file e percentuale di utilizzo su `250 GiB` (configurabile con `BUCKET_QUOTA_GIB`, cache 5 minuti con refresh manuale). *Nota: il traffico outbound (1 TiB/mese) non è esposto dalle API di DigitalOcean Spaces ed è consultabile dal pannello Billing.*
 - **Interfaccia**: Bootstrap 5.3 + Font Awesome 6.5 sui toni di grigio con toggle tema Chiaro/Scuro salvato in `localStorage`.
 
 ---
@@ -43,6 +44,7 @@ RETENTION_DAYS=30
 # FLASK_PORT=5000
 # FLASK_DEBUG=false
 # MAX_FOLDER_ZIP_BYTES=524288000
+# BUCKET_QUOTA_GIB=250
 ```
 
 > Se `APP_USERNAME` e `APP_PASSWORD` sono impostati, l'applicazione abilita automaticamente HTTP Basic Auth.

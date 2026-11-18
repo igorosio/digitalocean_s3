@@ -126,6 +126,40 @@
       </div>
     </div>
 
+    <!-- Bucket Storage Bar -->
+    <div class="card shadow-sm mb-3">
+      <div class="card-body py-2 px-3 d-flex flex-wrap align-items-center justify-content-between gap-3 small">
+        <div class="d-flex align-items-center gap-2 flex-grow-1" style="min-width: 240px;">
+          <i class="fa-solid fa-hard-drive text-secondary"></i>
+          <span class="text-body-secondary text-nowrap">Spazio bucket:</span>
+          <span id="bucketStatsText" class="fw-medium text-nowrap">Calcolo in corso...</span>
+          <div class="progress flex-grow-1" style="height: 6px; max-width: 220px;">
+            <div
+              id="bucketStatsBar"
+              class="progress-bar bg-secondary"
+              role="progressbar"
+              style="width: 0%;"
+              aria-valuenow="0"
+              aria-valuemin="0"
+              aria-valuemax="100"
+            ></div>
+          </div>
+          <button
+            type="button"
+            class="btn btn-sm btn-outline-secondary py-0 px-2"
+            id="refreshStatsBtn"
+            title="Aggiorna dimensione bucket"
+            aria-label="Aggiorna dimensione bucket"
+          >
+            <i class="fa-solid fa-arrows-rotate" id="refreshStatsIcon"></i>
+          </button>
+        </div>
+        <div class="text-body-secondary text-nowrap" title="DigitalOcean non espone API per il traffico outbound di Spaces; verificabile dal pannello Billing">
+          <i class="fa-solid fa-arrow-right-arrow-left me-1"></i>Outbound: <span class="fst-italic">1 TiB/mese (vedi pannello DO)</span>
+        </div>
+      </div>
+    </div>
+
     <!-- Breadcrumbs & Actions Toolbar -->
     <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
       <nav aria-label="breadcrumb" class="flex-grow-1">
@@ -635,6 +669,36 @@
         mkdirSubmitBtn.disabled = false;
       }
     });
+
+    // Bucket Stats (250 GiB quota)
+    const bucketStatsText = document.getElementById('bucketStatsText');
+    const bucketStatsBar = document.getElementById('bucketStatsBar');
+    const refreshStatsBtn = document.getElementById('refreshStatsBtn');
+    const refreshStatsIcon = document.getElementById('refreshStatsIcon');
+
+    async function loadBucketStats(refresh = false) {
+      refreshStatsIcon.classList.add('fa-spin');
+      try {
+        const url = refresh ? '/api/bucket-stats?refresh=1' : '/api/bucket-stats';
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!res.ok) {
+          bucketStatsText.textContent = 'Non disponibile';
+          return;
+        }
+        const pctClamped = Math.min(100, data.percent);
+        bucketStatsText.textContent = `${data.total_human} / ${data.quota_gib} GiB (${data.percent}%) · ${data.total_files} file`;
+        bucketStatsBar.style.width = `${pctClamped}%`;
+        bucketStatsBar.setAttribute('aria-valuenow', pctClamped);
+      } catch (err) {
+        bucketStatsText.textContent = 'Errore caricamento';
+      } finally {
+        refreshStatsIcon.classList.remove('fa-spin');
+      }
+    }
+
+    refreshStatsBtn.addEventListener('click', () => loadBucketStats(true));
+    loadBucketStats(false);
   </script>
 </body>
 </html>
